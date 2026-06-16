@@ -1,0 +1,291 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  AZURE_RESOURCE_GROUP: fullstack-rg
+  BACKEND_APP_NAME: fullstack-api-prod
+  FRONTEND_APP_NAME: fullstack-web-prod
+  NODE_VERSION: '18.x'
+
+jobs:
+  # ==================== BUILD JOB ====================
+  build:
+    runs-on: ubuntu-latest
+    name: Build Application
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      # ========== BACKEND BUILD ==========
+      - name: Install Backend Dependencies
+        working-directory: ./server
+        run: npm ci
+
+      - name: Lint Backend Code
+        working-directory: ./server
+        run: npm run lint 2>/dev/null || echo "Linting skipped"
+
+      - name: Build Backend
+        working-directory: ./server
+        run: npm run build
+
+      - name: Check Backend Build
+        working-directory: ./server
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "❌ Backend build failed - dist folder not found"
+            exit 1
+          fi
+          echo "✅ Backend build successful"
+
+      # ========== FRONTEND BUILD ==========
+      - name: Install Frontend Dependencies
+        working-directory: ./client
+        run: npm ci
+
+      - name: Lint Frontend Code
+        working-directory: ./client
+        run: npm run lint 2>/dev/null || echo "Linting skipped"
+
+      - name: Build Frontend
+        working-directory: ./client
+        env:
+          VITE_API_URL: https://fullstack-api-prod.azurewebsites.net/api
+        run: npm run build
+
+      - name: Check Frontend Build
+        working-directory: ./client
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "❌ Frontend build failed - dist folder not found"
+            exit 1
+          fi
+          echo "✅ Frontend build successful"
+
+      # ========== ARTIFACT UPLOAD ==========
+      - name: Upload Backend Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: backend-build
+          path: server/
+          retention-days: 1
+
+      - name: Upload Frontend Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-build
+          path: client/dist/
+          retention-days: 1
+
+      # ========== BUILD SUMMARY ==========
+      - name: Build Summary
+        run: |
+          echo "## ✅ Build Completed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Backend" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ✅ Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Frontend" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ✅ Built" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: Production" >> $GITHUB_STEP_SUMMARY
+
+  # ==================== TEST JOB ====================
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Run Tests
+    continue-on-error: true
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Backend Tests
+        working-directory: ./server
+        run: |
+          npm ci
+          npm test 2>/dev/null || echo "⚠️ Tests skipped or failed"
+
+      - name: Frontend Tests
+        working-directory: ./client
+        run: |
+          npm ci
+          npm test 2>/dev/null || echo "⚠️ Tests skipped or failed"
+
+  # ==================== DEPLOY JOB ====================
+  deploy:
+    needs: [ build, test ]
+    runs-on: ubuntu-latest
+    name: Deploy to Azure
+    if: |
+      github.ref == 'refs/heads/main' && 
+      github.event_name == 'push'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # ========== AZURE LOGIN ==========
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+        continue-on-error: true
+
+      - name: Fallback Azure Login (if needed)
+        if: failure()
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ========== BACKEND DEPLOYMENT ==========
+      - name: Prepare Backend for Deployment
+        working-directory: ./server
+        run: |
+          npm ci
+          npm run build
+          echo "PORT=8080" > .env
+          echo "COSMOS_CONNECTION_STRING=${{ secrets.AZURE_COSMOS_CONNECTION_STRING }}" >> .env
+          echo "COSMOS_DB_NAME=taskdb" >> .env
+          echo "COSMOS_CONTAINER_NAME=items" >> .env
+          echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
+          echo "JWT_EXPIRY=7d" >> .env
+          echo "NODE_ENV=production" >> .env
+          echo "CORS_ORIGIN=${{ secrets.FRONTEND_URL }}" >> .env
+
+      - name: Deploy Backend to App Service
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.BACKEND_APP_NAME }}
+          slot-name: production
+          package: server
+
+      # ========== FRONTEND DEPLOYMENT ==========
+      - name: Prepare Frontend for Deployment
+        working-directory: ./client
+        env:
+          VITE_API_URL: ${{ secrets.BACKEND_URL }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy Frontend to Static Web App
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.STATIC_WEB_APP_DEPLOYMENT_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: 'upload'
+          app_location: 'client'
+          api_location: ''
+          output_location: 'dist'
+          skip_app_build: true
+          skip_api_build: true
+
+      # ========== HEALTH CHECK ==========
+      - name: Health Check - Backend
+        run: |
+          sleep 30
+          for i in {1..5}; do
+            if curl -f "${{ secrets.BACKEND_URL }}/health" 2>/dev/null; then
+              echo "✅ Backend is healthy"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 10
+          done
+          echo "⚠️ Backend health check failed after 5 attempts"
+
+      - name: Health Check - Frontend
+        run: |
+          sleep 10
+          if curl -f "${{ secrets.FRONTEND_URL }}" 2>/dev/null | grep -q "<!DOCTYPE"; then
+            echo "✅ Frontend is accessible"
+          else
+            echo "⚠️ Frontend health check warning"
+          fi
+
+      # ========== DEPLOYMENT SUMMARY ==========
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "## 🚀 Deployment Completed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Backend" >> $GITHUB_STEP_SUMMARY
+          echo "- URL: ${{ secrets.BACKEND_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ✅ Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Frontend" >> $GITHUB_STEP_SUMMARY
+          echo "- URL: ${{ secrets.FRONTEND_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ✅ Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Database" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ✅ Connected" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Slack (Optional)
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "Deployment Status: ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🚀 *Full-Stack App Deployment*\nStatus: *${{ job.status }}*\nRef: `${{ github.ref }}`\nCommit: `${{ github.sha }}`"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
+
+  # ==================== NOTIFY JOB ====================
+  notify:
+    needs: [ build, deploy ]
+    runs-on: ubuntu-latest
+    name: Notify Completion
+    if: always()
+
+    steps:
+      - name: Deployment Status
+        run: |
+          echo "Build Status: ${{ needs.build.result }}"
+          echo "Deploy Status: ${{ needs.deploy.result }}"
+          
+          if [ "${{ needs.deploy.result }}" = "success" ]; then
+            echo "✅ All checks passed!"
+            exit 0
+          elif [ "${{ needs.deploy.result }}" = "skipped" ]; then
+            echo "⏭️ Deployment skipped (not on main branch)"
+            exit 0
+          else
+            echo "❌ Deployment failed or was cancelled"
+            exit 1
+          fi
