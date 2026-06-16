@@ -15,7 +15,7 @@ const axiosInstance: AxiosInstance = axios.create({
 
 /**
  * Request interceptor
- * Automatically attaches JWT token to all requests
+ * Automatically attaches JWT token to all requests 
  */
 axiosInstance.interceptors.request.use(
   (config) => {
